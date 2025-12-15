@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Court Booking Checker</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <div class="wrapper">
+      <header class="header">
+        <h1>Court Booking Checker</h1>
+        <p class="subtitle">Find and book available badminton courts</p>
+      </header>
+
+      <div class="container">
+        <!-- Filter Bar -->
+        <div class="filter-card">
+          <div class="filter-group">
+            <div class="date-input-wrapper">
+              <label for="start">Start Date</label>
+              <input type="date" id="start" />
+            </div>
+            <div class="date-input-wrapper">
+              <label for="end">End Date</label>
+              <input type="date" id="end" />
+            </div>
+            <button id="check" class="btn-primary">Check Availability</button>
+          </div>
+        </div>
+
+        <!-- Status/Loader -->
+        <div id="loader" class="loader hidden">
+          <div class="spinner"></div>
+          <span>Checking availability…</span>
+          <span id="elapsed" class="elapsed">Elapsed: 0s</span>
+        </div>
+
+        <!-- Error -->
+        <div id="error" class="error-box hidden"></div>
+
+        <!-- Logs Section -->
+        <section class="logs-section">
+          <h2>Activity Log</h2>
+          <pre id="logs"></pre>
+        </section>
+
+        <!-- Results Section -->
+        <section class="results-section">
+          <h2>Available Slots</h2>
+          <div id="results"></div>
+        </section>
+      </div>
+    </div>
+
+    <script src="/static/main.js"></script>
+  </body>
+</html>
