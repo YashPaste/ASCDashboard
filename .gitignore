@@ -1,4 +1,6 @@
 .venv/
+.venv_render/
+debug_artifacts/
 __pycache__/
 *.pyc
 env/
