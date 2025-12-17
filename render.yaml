@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: court-booking
+    env: docker
+    plan: free
+    autoDeploy: true
