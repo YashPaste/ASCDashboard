@@ -3,6 +3,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from playwright.sync_api import Playwright, sync_playwright
+from logger import get_logger
+
+logger = get_logger(__name__)
 
 
 DEBUG_DIR = Path("debug_artifacts")
@@ -192,7 +195,7 @@ def get_available_slots_for_court(
     for attempt in range(1, max_attempts + 1):
         browser = context = page = None
         try:
-            browser = playwright.chromium.launch(headless=False)
+            browser = playwright.chromium.launch(headless=True)
             context = browser.new_context()
             page = context.new_page()
 
@@ -217,7 +220,7 @@ def get_available_slots_for_court(
             select2_choose_option(page, complex_label)
 
             safe_click(page.get_by_role("button", name="Next"), label="After complex Next")
-            major_pause(page)  # major transition to booking type step
+            # major_pause(page)  # major transition to booking type step
 
             # STEP 3: Booking type (major)
             wait_visible(page, "text=General Slot Booking", label="General Slot Booking visible")
@@ -225,7 +228,7 @@ def get_available_slots_for_court(
 
             safe_click(page.get_by_text("General Slot Booking"), label="Click General Slot Booking")
             safe_click(page.get_by_role("button", name="Next"), label="Next after booking type")
-            major_pause(page)  # major transition to facility step
+            # major_pause(page)  # major transition to facility step
 
             # STEP 4: Sports Facility (major)
             wait_visible(
@@ -318,8 +321,11 @@ def get_available_slots_for_court(
                     pass
                 continue
 
-            print(f"[FINAL FAIL] court={court_no} date={date_str} -> {type(e).__name__}: {e}")
-            print(f"Saved debug artifacts in: {DEBUG_DIR.resolve()}")
+            logger.error(
+                f"[FINAL FAIL] court={court_no} date={date_str} -> {type(e).__name__}: {e}",
+                exc_info=True,
+            )
+            logger.info(f"Saved debug artifacts in: {DEBUG_DIR.resolve()}")
             raise
 
     raise last_error
@@ -330,21 +336,21 @@ def get_available_slots_for_court(
 # ---------------------------
 
 if __name__ == "__main__":
-    START_DATE = "2025-12-18"
-    END_DATE = "2025-12-18"
+    START_DATE = "2025-12-19"
+    END_DATE = "2025-12-19"
 
     with sync_playwright() as p:
         for date_str in daterange(START_DATE, END_DATE):
-            print(f"\n==================== {date_str} ====================")
+            logger.info("\n==================== %s ====================", date_str)
             for court in range(1, 8):
                 label = f"Wooden Court {court}"
                 try:
                     slots = get_available_slots_for_court(p, court, date_str)
                     if slots:
-                        print(f"{label}:")
+                        logger.info("%s:", label)
                         for s in slots:
-                            print(" ✔", s)
+                            logger.info(" ✔ %s", s)
                     else:
-                        print(f"{label}: ✖ No available slots")
+                        logger.info("%s: ✖ No available slots", label)
                 except Exception as e:
-                    print(f"{label}: ERROR while checking ({type(e).__name__}: {e})")
+                    logger.error("%s: ERROR while checking (%s: %s)", label, type(e).__name__, e)

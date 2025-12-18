@@ -8,8 +8,11 @@ import json
 import time
 
 from recorded import get_available_slots_for_court, daterange
+from logger import get_logger
 
 app = Flask(__name__)
+
+logger = get_logger(__name__)
 
 # In-memory job store: job_id -> {queue, results, finished}
 jobs = {}
@@ -51,7 +54,7 @@ def check_slots():
         jobs[job_id] = job
 
     def run_job():
-        logs_print = print
+        logs_print = logger.info
         results = {}
         with sync_playwright() as p:
             # Monkeypatch the chromium.launch to force headless mode (only here)
@@ -81,7 +84,7 @@ def check_slots():
                             results[date_str][str(court)] = "ERROR"
                             q.put({"type": "log", "msg": f"{date_str} {label}: ERROR: {type(e).__name__}: {e}"})
                             q.put({"type": "result_partial", "date": date_str, "court": str(court), "value": "ERROR"})
-                            logs_print(f"{date_str} {label}: ERROR: {type(e).__name__}: {e}")
+                            logger.error(f"{date_str} {label}: ERROR: {type(e).__name__}: {e}")
             finally:
                 try:
                     p.chromium.launch = original_launch
