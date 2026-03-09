@@ -1,23 +1,27 @@
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from playwright.sync_api import Playwright, sync_playwright
 from logger import get_logger
 
 logger = get_logger(__name__)
 
-
 DEBUG_DIR = Path("debug_artifacts")
 DEBUG_DIR.mkdir(exist_ok=True)
 
 
 # ---------------------------
-# Major step pause (2s)
+# Pause helpers (reduced)
 # ---------------------------
 
 def major_pause(page, ms: int = 2000):
-    """Pause only at major page transitions / wizard steps."""
+    """Pause at major page transitions / wizard steps."""
+    page.wait_for_timeout(ms)
+
+
+def mini_pause(page, ms: int = 200):
     page.wait_for_timeout(ms)
 
 
@@ -38,7 +42,7 @@ def safe_click(locator, timeout=15000, retries=3, label=""):
                 return
             except Exception as e2:
                 last = e2
-            locator.page.wait_for_timeout(250)
+            locator.page.wait_for_timeout(200)
     try:
         locator.evaluate("el => el.click()")
         return
@@ -180,7 +184,214 @@ def daterange(start_date: str, end_date: str):
 
 
 # ---------------------------
-# Main scraper
+# Resource blocking (safe — analytics/tracking only)
+# CSS and JS are NOT blocked because the wizard relies on
+# CSS to hide inactive steps (14 "Next" buttons exist, only
+# the active step's button should be visible/clickable).
+# ---------------------------
+
+BLOCKED_URL_PATTERNS = [
+    "google-analytics", "googletagmanager", "facebook",
+    "doubleclick", "hotjar", "clarity.ms", "cdn.heapanalytics",
+]
+
+
+def block_unnecessary_resources(route, request):
+    """Block only analytics/tracking scripts. CSS/JS/fonts stay intact."""
+    url = request.url.lower()
+    for pattern in BLOCKED_URL_PATTERNS:
+        if pattern in url:
+            route.abort()
+            return
+    # Block only images and media (safe — no layout impact)
+    if request.resource_type in {"image", "media"}:
+        route.abort()
+        return
+    route.continue_()
+
+
+# ---------------------------
+# Navigate to facility step (Steps 0-4)
+# Shared across all courts — this is the common prefix
+# ---------------------------
+
+def navigate_to_facility_step(page):
+    """Navigate from landing page through Step 4 (Badminton selected).
+    After this, the page is ready for court selection (Step 5).
+    """
+    complex_label = "Shahaji Raje Bhosle Kreeda Sankul, Andheri"
+
+    # STEP 0: Landing
+    page.goto(
+        "https://reczone.mcgm.gov.in/sports-complex/book-your-sport",
+        wait_until="domcontentloaded",
+    )
+    wait_visible(page, "button:has-text('Next')", label="Step0 Next")
+
+    # STEP 1: Next (use .first — page has 14 Next buttons, CSS hides inactive ones)
+    safe_click(page.get_by_role("button", name="Next").first, label="Step1 Next")
+    major_pause(page)
+
+    # STEP 2: Sports complex
+    wait_visible(page, "#select2-reczone-dropdown-container-container", label="Sports complex container")
+    major_pause(page)
+
+    open_select2_by_container_id(page, "#select2-reczone-dropdown-container-container")
+    wait_visible(page, "input.select2-search__field", label="complex search field")
+    page.locator("input.select2-search__field").first.fill(complex_label)
+    select2_choose_option(page, complex_label)
+
+    safe_click(page.get_by_role("button", name="Next").first, label="After complex Next")
+
+    # STEP 3: Booking type
+    wait_visible(page, "text=General Slot Booking", label="General Slot Booking visible")
+    major_pause(page)
+
+    safe_click(page.get_by_text("General Slot Booking").first, label="Click General Slot Booking")
+    safe_click(page.get_by_role("button", name="Next").first, label="Next after booking type")
+
+    # STEP 4: Sports Facility
+    wait_visible(
+        page,
+        "span.select2-selection__placeholder:has-text('Select your Sports Facility')",
+        label="Facility placeholder",
+    )
+    major_pause(page)
+
+    open_select2_by_placeholder_text(page, "Select your Sports Facility")
+    select2_choose_option(page, "Badminton")
+    major_pause(page)
+
+
+# ---------------------------
+# From facility step, pick court + date and collect slots (Steps 5-6)
+# ---------------------------
+
+def get_slots_from_facility_step(page, court_no: int, date_str: str):
+    """Starting from facility-selected state, pick court, date, and return slots."""
+    court_label = f"Wooden Court {court_no} | 968 Sq ft"
+
+    # STEP 5: Court
+    wait_visible(
+        page,
+        "span.select2-selection__placeholder:has-text('Select your Sports Sub-Facility')",
+        label="Sub-facility placeholder",
+    )
+    open_select2_by_placeholder_text(page, "Select your Sports Sub-Facility")
+
+    opts = page.locator("li.select2-results__option").filter(has_text=court_label)
+
+    if opts.count() == 0:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(250)
+        open_select2_by_placeholder_text(page, "Select your Sports Sub-Facility")
+        opts = page.locator("li.select2-results__option").filter(has_text=court_label)
+
+    if opts.count() == 0:
+        raise RuntimeError(f"Court option not found: {court_label}")
+
+    safe_click(opts.first, label=f"Select court {court_no}")
+    safe_click(page.get_by_role("button", name="Next").first, label="Next to slots")
+    major_pause(page)
+
+    # STEP 6: Slots + date
+    wait_visible(page, "div.date-button", label="Slots date buttons")
+    target_selector = f"div.date-button[data-active-date='{date_str}']"
+    day_btn = page.locator(target_selector).first
+    if day_btn.count() == 0:
+        raise RuntimeError(f"Date button not found for {date_str}")
+
+    safe_click(day_btn, label=f"Click date {date_str}")
+    major_pause(page)
+
+    wait_visible(page, "div.timeslot-btn", label="Timeslot grid")
+    mini_pause(page, 300)
+
+    # Collect slots
+    slot_cards = page.locator("div.timeslot-btn")
+    available = []
+
+    for i in range(slot_cards.count()):
+        card = slot_cards.nth(i)
+        text = card.inner_text().strip()
+        if not re.search(r"(am|pm)", text):
+            continue
+
+        opacity = card.evaluate("el => window.getComputedStyle(el).opacity")
+        pointer_events = card.evaluate("el => window.getComputedStyle(el).pointerEvents")
+
+        if opacity != "1" or pointer_events == "none":
+            continue
+
+        available.append(text)
+
+    return available
+
+
+# ---------------------------
+# Single court worker (for parallel execution)
+# ---------------------------
+
+def check_single_court(court_no: int, date_str: str, max_attempts: int = 2):
+    """Self-contained: launches its own Playwright + browser, checks one court.
+    Designed to run in a thread.
+    """
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        browser = context = page = None
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True)
+                context = browser.new_context(
+                    viewport={"width": 1280, "height": 720},
+                    java_script_enabled=True,
+                )
+                page = context.new_page()
+
+                # Block heavy resources
+                page.route("**/*", block_unnecessary_resources)
+
+                # Navigate Steps 0-4 (common for all courts)
+                navigate_to_facility_step(page)
+
+                # Steps 5-6 (court-specific)
+                slots = get_slots_from_facility_step(page, court_no, date_str)
+
+                context.close()
+                browser.close()
+                return slots
+
+        except Exception as e:
+            last_error = e
+            if page:
+                dump_debug(page, f"attempt{attempt}_court{court_no}_{date_str}")
+            logger.warning(
+                f"[Attempt {attempt}] court={court_no} date={date_str} -> {type(e).__name__}: {e}"
+            )
+            try:
+                if context:
+                    context.close()
+            except Exception:
+                pass
+            try:
+                if browser:
+                    browser.close()
+            except Exception:
+                pass
+
+            if attempt >= max_attempts:
+                logger.error(
+                    f"[FINAL FAIL] court={court_no} date={date_str} -> {type(e).__name__}: {e}",
+                    exc_info=True,
+                )
+                raise
+
+    raise last_error
+
+
+# ---------------------------
+# Original function (kept for backward compat)
 # ---------------------------
 
 def get_available_slots_for_court(
@@ -189,146 +400,55 @@ def get_available_slots_for_court(
     date_str: str,
     max_attempts: int = 2,
 ):
-    complex_label = "Shahaji Raje Bhosle Kreeda Sankul, Andheri"
-    last_error = None
+    """Backward-compatible wrapper. Ignores the playwright arg and calls check_single_court."""
+    return check_single_court(court_no, date_str, max_attempts)
 
-    for attempt in range(1, max_attempts + 1):
-        browser = context = page = None
-        try:
-            browser = playwright.chromium.launch(headless=True)
-            context = browser.new_context()
-            page = context.new_page()
 
-            # STEP 0: Landing
-            page.goto(
-                "https://reczone.mcgm.gov.in/sports-complex/book-your-sport",
-                wait_until="domcontentloaded",
-            )
-            wait_visible(page, "button:has-text('Next')", label="Step0 Next")
+# ---------------------------
+# Parallel batch checker
+# ---------------------------
 
-            # STEP 1: Next (moves to complex step)
-            safe_click(page.get_by_role("button", name="Next"), label="Step1 Next")
-            major_pause(page)  # major transition
+def check_all_courts_parallel(
+    date_str: str,
+    courts: list = None,
+    max_workers: int = 3,
+    progress_callback=None,
+):
+    """Check multiple courts in parallel for a given date.
 
-            # STEP 2: Sports complex (major)
-            wait_visible(page, "#select2-reczone-dropdown-container-container", label="Sports complex container")
-            major_pause(page)  # before interacting with the dropdown
+    Args:
+        date_str: Date string YYYY-MM-DD
+        courts: List of court numbers (default 1-7)
+        max_workers: Max parallel browsers (3 is safe for Render Free 512MB)
+        progress_callback: Optional fn(court_no, status, slots_or_error) called per court
 
-            open_select2_by_container_id(page, "#select2-reczone-dropdown-container-container")
-            wait_visible(page, "input.select2-search__field", label="complex search field")
-            page.locator("input.select2-search__field").first.fill(complex_label)
-            select2_choose_option(page, complex_label)
+    Returns:
+        dict: {court_no_str: slots_list_or_"ERROR"}
+    """
+    if courts is None:
+        courts = list(range(1, 8))
 
-            safe_click(page.get_by_role("button", name="Next"), label="After complex Next")
-            # major_pause(page)  # major transition to booking type step
+    results = {}
 
-            # STEP 3: Booking type (major)
-            wait_visible(page, "text=General Slot Booking", label="General Slot Booking visible")
-            major_pause(page)  # allow cards/overlay to settle
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_court = {
+            executor.submit(check_single_court, court, date_str): court
+            for court in courts
+        }
 
-            safe_click(page.get_by_text("General Slot Booking"), label="Click General Slot Booking")
-            safe_click(page.get_by_role("button", name="Next"), label="Next after booking type")
-            # major_pause(page)  # major transition to facility step
+        for future in as_completed(future_to_court):
+            court = future_to_court[future]
+            try:
+                slots = future.result()
+                results[str(court)] = slots
+                if progress_callback:
+                    progress_callback(court, "ok", slots)
+            except Exception as e:
+                results[str(court)] = "ERROR"
+                if progress_callback:
+                    progress_callback(court, "error", str(e))
 
-            # STEP 4: Sports Facility (major)
-            wait_visible(
-                page,
-                "span.select2-selection__placeholder:has-text('Select your Sports Facility')",
-                label="Facility placeholder",
-            )
-            major_pause(page)  # before opening facility dropdown
-
-            open_select2_by_placeholder_text(page, "Select your Sports Facility")
-            select2_choose_option(page, "Badminton")
-            major_pause(page)  # after selecting badminton (sub-facility list often hydrates)
-
-            # STEP 5: Court
-            wait_visible(
-                page,
-                "span.select2-selection__placeholder:has-text('Select your Sports Sub-Facility')",
-                label="Sub-facility placeholder",
-            )
-            open_select2_by_placeholder_text(page, "Select your Sports Sub-Facility")
-
-            court_label = f"Wooden Court {court_no} | 968 Sq ft"
-            opts = page.locator("li.select2-results__option").filter(has_text=court_label)
-
-            # One retry if option list is late (NO 2s pause, just quick recovery)
-            if opts.count() == 0:
-                page.keyboard.press("Escape")
-                page.wait_for_timeout(250)
-                open_select2_by_placeholder_text(page, "Select your Sports Sub-Facility")
-                opts = page.locator("li.select2-results__option").filter(has_text=court_label)
-
-            if opts.count() == 0:
-                raise RuntimeError(f"Court option not found: {court_label}")
-
-            safe_click(opts.first, label=f"Select court {court_no}")
-
-            safe_click(page.get_by_role("button", name="Next"), label="Next to slots")
-            major_pause(page)  # major transition to slots page
-
-            # STEP 6: Slots + date (major)
-            wait_visible(page, "div.date-button", label="Slots date buttons")
-            target_selector = f"div.date-button[data-active-date='{date_str}']"
-            day_btn = page.locator(target_selector).first
-            if day_btn.count() == 0:
-                raise RuntimeError(f"Date button not found for {date_str}")
-
-            safe_click(day_btn, label=f"Click date {date_str}")
-            major_pause(page)  # allow grid to fully refresh after date click
-
-            wait_visible(page, "div.timeslot-btn", label="Timeslot grid")
-            page.wait_for_timeout(300)  # small buffer only (not 2s)
-
-            # Collect slots
-            slot_cards = page.locator("div.timeslot-btn")
-            available = []
-
-            for i in range(slot_cards.count()):
-                card = slot_cards.nth(i)
-                text = card.inner_text().strip()
-                if not re.search(r"(am|pm)", text):
-                    continue
-
-                opacity = card.evaluate("el => window.getComputedStyle(el).opacity")
-                pointer_events = card.evaluate("el => window.getComputedStyle(el).pointerEvents")
-
-                if opacity != "1" or pointer_events == "none":
-                    continue
-
-                available.append(text)
-
-            context.close()
-            browser.close()
-            return available
-
-        except Exception as e:
-            last_error = e
-            if page:
-                dump_debug(page, f"attempt{attempt}_court{court_no}_{date_str}")
-
-            if attempt < max_attempts:
-                try:
-                    if context:
-                        context.close()
-                except Exception:
-                    pass
-                try:
-                    if browser:
-                        browser.close()
-                except Exception:
-                    pass
-                continue
-
-            logger.error(
-                f"[FINAL FAIL] court={court_no} date={date_str} -> {type(e).__name__}: {e}",
-                exc_info=True,
-            )
-            logger.info(f"Saved debug artifacts in: {DEBUG_DIR.resolve()}")
-            raise
-
-    raise last_error
+    return results
 
 
 # ---------------------------
@@ -339,18 +459,20 @@ if __name__ == "__main__":
     START_DATE = "2025-12-19"
     END_DATE = "2025-12-19"
 
-    with sync_playwright() as p:
-        for date_str in daterange(START_DATE, END_DATE):
-            logger.info("\n==================== %s ====================", date_str)
-            for court in range(1, 8):
-                label = f"Wooden Court {court}"
-                try:
-                    slots = get_available_slots_for_court(p, court, date_str)
-                    if slots:
-                        logger.info("%s:", label)
-                        for s in slots:
-                            logger.info(" ✔ %s", s)
-                    else:
-                        logger.info("%s: ✖ No available slots", label)
-                except Exception as e:
-                    logger.error("%s: ERROR while checking (%s: %s)", label, type(e).__name__, e)
+    for date_str in daterange(START_DATE, END_DATE):
+        logger.info("\n==================== %s ====================", date_str)
+
+        def on_progress(court, status, data):
+            label = f"Wooden Court {court}"
+            if status == "ok":
+                logger.info(f"{label}: {len(data)} slots found")
+                for s in data:
+                    logger.info(f"  ✔ {s}")
+            else:
+                logger.error(f"{label}: ERROR - {data}")
+
+        results = check_all_courts_parallel(
+            date_str,
+            max_workers=3,
+            progress_callback=on_progress,
+        )
