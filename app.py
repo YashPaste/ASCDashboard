@@ -26,7 +26,7 @@ jobs_lock = threading.Lock()
 # Max parallel browsers. On Render Free (512MB), 3 is safe.
 # On Render Starter (2GB), you can push to 5-7.
 # Locally with 8GB+, try 4-7.
-MAX_PARALLEL_COURTS = 3
+MAX_PARALLEL_COURTS = 2
 
 
 @app.route("/")
